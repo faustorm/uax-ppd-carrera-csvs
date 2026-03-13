@@ -36,7 +36,7 @@ def encrypt_name(name, shift=3):
     return "".join(result)
 
 
-def process_chunk(filename, start_offset, end_offset, tocayos_encrypted, fausto_encrypted):
+def process_chunk(filename, start_offset, end_offset, tocayos_encrypted, fausto_encrypted, tocayos_raw):
     age_range_salary = {}
     votes_party = {}
     city_salary = {}
@@ -46,7 +46,7 @@ def process_chunk(filename, start_offset, end_offset, tocayos_encrypted, fausto_
     total_age = 0
     count_age = 0
     count_fausto = 0
-    count_tocayos = 0
+    count_tocayos = {}  # name -> count
     count_unemployed = 0
 
     with open(filename, 'r', encoding='utf-8') as f:
@@ -105,9 +105,9 @@ def process_chunk(filename, start_offset, end_offset, tocayos_encrypted, fausto_
                 if fausto_encrypted in nombre:
                     count_fausto += 1
 
-                for t in tocayos_encrypted:
+                for t, raw in zip(tocayos_encrypted, tocayos_raw):
                     if t in nombre:
-                        count_tocayos += 1
+                        count_tocayos[raw] = count_tocayos.get(raw, 0) + 1
 
             if f.tell() >= end_offset:
                 break
@@ -121,13 +121,13 @@ def process_chunk(filename, start_offset, end_offset, tocayos_encrypted, fausto_
         'votes_party': votes_party,
         'city_salary': city_salary,
         'count_fausto': count_fausto,
-        'count_tocayos': count_tocayos,
+        'count_tocayos': count_tocayos,  # dict name->count
         'count_unemployed': count_unemployed
     }
 
 
-def worker_main(file_path, start_offset, end_offset, pipe_conn, tocayos_encrypted, fausto_encrypted):
-    stats = process_chunk(file_path, start_offset, end_offset, tocayos_encrypted, fausto_encrypted)
+def worker_main(file_path, start_offset, end_offset, pipe_conn, tocayos_encrypted, fausto_encrypted, tocayos_raw):
+    stats = process_chunk(file_path, start_offset, end_offset, tocayos_encrypted, fausto_encrypted, tocayos_raw)
     pipe_conn.send(stats)
     pipe_conn.close()
 
@@ -136,7 +136,7 @@ def main():
     file_path = 'c:/Users/Fausto UAX/code/uax-ppd-carrera-csvs/datos_valientes.csv'
 
     # <<< Replace with your group's first names (no accents needed, just plain names) >>>
-    tocayos_raw = ["Fausto", "Valentin"]
+    tocayos_raw = ["Fausto", "Rodrigo", "Adriana", "David", "Carlos", "Paula", "Rafael", "Adriana", "Alejandra", "Lucía", "Eva"]
     tocayos_encrypted = [encrypt_name(n) for n in tocayos_raw]
     fausto_encrypted = encrypt_name("Fausto")
 
@@ -183,7 +183,7 @@ def main():
         pipes.append(parent_conn)
         p = multiprocessing.Process(
             target=worker_main,
-            args=(file_path, start, end, child_conn, tocayos_encrypted, fausto_encrypted)
+            args=(file_path, start, end, child_conn, tocayos_encrypted, fausto_encrypted, tocayos_raw)
         )
         processes.append(p)
         p.start()
@@ -206,7 +206,7 @@ def main():
     votes_party = {}
     city_salary = {}
     count_fausto = 0
-    count_tocayos = 0
+    count_tocayos = {}  # name -> count
     count_unemployed = 0
 
     for r in results:
@@ -215,7 +215,8 @@ def main():
         total_age += r['total_age']
         count_age += r['count_age']
         count_fausto += r['count_fausto']
-        count_tocayos += r['count_tocayos']
+        for name, cnt in r['count_tocayos'].items():
+            count_tocayos[name] = count_tocayos.get(name, 0) + cnt
         count_unemployed += r['count_unemployed']
 
         for arange, val in r['age_range_salary'].items():
@@ -244,13 +245,55 @@ def main():
     # Winning party coalition (minimum parties to exceed 50% of all votes)
     total_votes = sum(votes_party.values())
     sorted_parties = sorted(votes_party.items(), key=lambda x: x[1], reverse=True)
-    winning_combo = []
-    accumulated = 0
-    for party, votes in sorted_parties:
-        winning_combo.append(f"{party} ({votes:,})")
-        accumulated += votes
-        if accumulated > total_votes / 2:
-            break
+
+    def compute_coalition(exclude_pairs=None):
+        """Returns (combo_labels, accumulated, is_valid) picking parties in order,
+        skipping combinations that contain all parties in any of the excluded pairs."""
+        combo = []
+        acc = 0
+        excluded = set()
+        if exclude_pairs:
+            for pair in exclude_pairs:
+                if all(p in [x[0] for x in sorted_parties[:2]] for p in pair):
+                    excluded.update(pair)
+
+        for party, votes in sorted_parties:
+            if party in excluded:
+                continue
+            combo.append(f"{party} ({votes:,})")
+            acc += votes
+            if acc > total_votes / 2:
+                break
+        return combo, acc
+
+    winning_combo, accumulated = compute_coalition()
+    winning_party_names = [c.split(' (')[0] for c in winning_combo]
+
+    # Check if it's the 'impossible' PP + PSOE scenario
+    pp_psoe_impossible = 'PP' in winning_party_names and 'PSOE' in winning_party_names
+    alternative_combo, alt_accumulated = None, 0
+    if pp_psoe_impossible:
+        # Try all combinations of parties (in ranked order) excluding PP or PSOE from the pair
+        # Strategy: try without PP, then without PSOE, pick whichever needs fewer parties
+        def coalition_excluding(banned):
+            combo = []
+            acc = 0
+            for party, votes in sorted_parties:
+                if party == banned:
+                    continue
+                combo.append(f"{party} ({votes:,})")
+                acc += votes
+                if acc > total_votes / 2:
+                    break
+            return combo, acc
+
+        combo_no_pp, acc_no_pp = coalition_excluding('PP')
+        combo_no_psoe, acc_no_psoe = coalition_excluding('PSOE')
+        # Pick the option with fewer parties (or larger margin)
+        if len(combo_no_pp) <= len(combo_no_psoe):
+            alternative_combo, alt_accumulated = combo_no_pp, acc_no_pp
+        else:
+            alternative_combo, alt_accumulated = combo_no_psoe, acc_no_psoe
 
     # City ranking by average salary (only cities with >100 salaried people for stability)
     city_avg = [(city, val[0] / val[1]) for city, val in city_salary.items() if val[1] > 100]
@@ -269,10 +312,26 @@ def main():
     print(f"3. Rango de edad (5 anos) con mayor salario:")
     print(f"   {best_range} - {best_range+4} anos  (avg: {best_range_avg:,.2f} EUR)")
     print(f"4. Coalicion ganadora (>50% votos):")
-    print(f"   {' + '.join(winning_combo)}")
-    print(f"   ({accumulated:,} / {total_votes:,} votos = {accumulated/total_votes*100:.2f}%)")
+    if pp_psoe_impossible:
+        print(f"   Matematicamente: {' + '.join(winning_combo)}")
+        print(f"   ({accumulated:,} / {total_votes:,} = {accumulated/total_votes*100:.2f}%)")
+        print(f"   *** PP y PSOE juntos es IMPOSIBLE en la practica ***")
+        print(f"   Siguiente mejor coalicion viable:")
+        print(f"   {' + '.join(alternative_combo)}")
+        print(f"   ({alt_accumulated:,} / {total_votes:,} = {alt_accumulated/total_votes*100:.2f}%)")
+    else:
+        print(f"   {' + '.join(winning_combo)}")
+        print(f"   ({accumulated:,} / {total_votes:,} votos = {accumulated/total_votes*100:.2f}%)")
     print(f"5. Personas llamadas 'Fausto': {count_fausto}")
-    print(f"6. Tocayos del grupo ({', '.join(tocayos_raw)}): {count_tocayos}")
+    total_tocayos = sum(count_tocayos.values())
+    print(f"6. Tocayos del grupo - Total: {total_tocayos}")
+    # Show unique names (deduplicated) with their counts
+    seen = {}
+    for name in tocayos_raw:
+        if name not in seen:
+            seen[name] = count_tocayos.get(name, 0)
+    for name, cnt in sorted(seen.items(), key=lambda x: x[1], reverse=True):
+        print(f"   - {name}: {cnt}")
     print(f"7. Ciudades mas ricas (avg salario):")
     for city, s in top_3_rich:
         print(f"   - {city}: {s:,.2f}")
